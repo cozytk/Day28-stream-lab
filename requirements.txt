@@ -1,0 +1,3 @@
+# Generator / Python Consumer 공통 의존성
+confluent-kafka     # Kafka Producer/Consumer (librdkafka 기반 고성능 클라이언트)
+psycopg2-binary     # PostgreSQL 드라이버 (Python Consumer → DB 저장용)

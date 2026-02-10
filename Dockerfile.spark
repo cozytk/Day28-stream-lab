@@ -1,0 +1,36 @@
+# Spark + Kafka + JDBC 환경 구축
+# Apache Spark에 Kafka 및 PostgreSQL 연동을 위한 커넥터 추가
+
+FROM apache/spark:latest
+
+# 버전 정의
+ARG SPARK_VERSION=4.1.1
+ARG SCALA_VERSION=2.13
+ARG COMMONS_POOL_VERSION=2.12.1
+ARG KAFKA_CLIENTS_VERSION=4.0.0
+ARG POSTGRES_JDBC_VERSION=42.7.4
+
+# Spark Kafka 커넥터 및 의존성 다운로드
+# - spark-sql-kafka: Structured Streaming에서 Kafka 소스/싱크 지원
+# - spark-token-provider-kafka: Kafka 인증 토큰 제공
+# - commons-pool2: 커넥션 풀링 라이브러리
+# - kafka-clients: Kafka 클라이언트 라이브러리
+RUN wget -q -P /opt/spark/jars/ \
+        "https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_${SCALA_VERSION}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_VERSION}-${SPARK_VERSION}.jar" && \
+    wget -q -P /opt/spark/jars/ \
+        "https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_${SCALA_VERSION}/${SPARK_VERSION}/spark-token-provider-kafka-0-10_${SCALA_VERSION}-${SPARK_VERSION}.jar" && \
+    wget -q -P /opt/spark/jars/ \
+        "https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${COMMONS_POOL_VERSION}/commons-pool2-${COMMONS_POOL_VERSION}.jar" && \
+    wget -q -P /opt/spark/jars/ \
+        "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"
+
+# PostgreSQL JDBC 드라이버 다운로드
+# - Spark에서 PostgreSQL 읽기/쓰기 지원
+RUN wget -q -P /opt/spark/jars/ \
+        "https://jdbc.postgresql.org/download/postgresql-${POSTGRES_JDBC_VERSION}.jar"
+
+# 작업 디렉토리 설정
+WORKDIR /opt/spark
+
+# 기본 사용자로 실행 (apache/spark 이미지는 기본적으로 spark 사용자 사용)
+USER spark

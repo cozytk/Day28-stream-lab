@@ -1,0 +1,11 @@
+# ==========================================
+# Generator / Python Consumer용 경량 Python 이미지
+# - pip 대신 uv를 사용하여 패키지 설치 속도 향상
+# - compose.yml에서 command로 uv pip install 실행
+# ==========================================
+FROM python:3.12-slim
+
+# uv (빠른 Python 패키지 매니저) - Flink Dockerfile과 동일 패턴
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app

@@ -1,0 +1,233 @@
+# =====================================================================
+# stream-lab: "From Possible to Reliable Real-time Processing"
+# 기본 Python 처리 가능성 확인 → 운영 한계 노출 → Flink 보완 비교 실습 환경
+#
+# 사용법:
+#   [Phase 1] 기본 처리 가능성 확인
+#     1. docker compose down -v
+#     2. docker compose up -d kafka postgres
+#     3. docker compose up generator python-consumer
+#        (기본값: CHAOS_ENABLED=false, RESULT_TABLE=baseline_results)
+#
+#   [Phase 2] 운영 한계 노출
+#     4. CHAOS_ENABLED=true RESULT_TABLE=naive_results \
+#        KAFKA_GROUP_ID=python-consumer-limit \
+#        docker compose up generator python-consumer
+#
+#   [Phase 4] Flink 보완 구현 비교
+#     5. docker compose exec jobmanager flink run -py /opt/flink/src/flink_job.py
+#                                             (Flink 잡 제출)
+#   6. psql -h localhost -p 5433 -U postgres -d streamdb
+#      SELECT * FROM baseline_results;        (기본 가능성 단계)
+#      SELECT * FROM naive_results;           (한계 노출 단계)
+#      SELECT * FROM flink_results;
+#
+#   [Bonus] Spark vs Flink 처리 속도 비교
+#     7. docker compose up -d spark-submit    (Spark Micro-batch 시작)
+#      SELECT * FROM spark_results;           (Spark 결과 비교)
+# =====================================================================
+
+services:
+  # -----------------------------------------------
+  # Kafka (KRaft 모드 - Zookeeper 없음)
+  # Kafka 4.x부터 KRaft가 유일한 모드
+  # payment-log 토픽은 AUTO_CREATE로 자동 생성
+  # -----------------------------------------------
+  kafka:
+    image: apache/kafka:4.1.1
+    environment:
+      KAFKA_NODE_ID: 1 # 노드 고유 식별자
+      KAFKA_PROCESS_ROLES: broker,controller # KRaft 모드에서의 역할 (브로커 및 컨트롤러)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093 # 서버가 수신 대기할 리스너 목록
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092 # 클라이언트가 접속 시 사용할 주소
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER # 컨트롤러 통신에 사용할 리스너 이름
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT # 리스너별 보안 프로토콜 매핑
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093 # 컨트롤러 선출을 위한 투표자 설정
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1 # 컨슈머 오프셋 토픽의 복제 계수 (단일 브로커이므로 1)
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # 트랜잭션 상태 로그 복제 계수
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1 # 트랜잭션 로그의 최소 동기화 복제본 수
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true" # 존재하지 않는 토픽 접근 시 자동 생성 허용
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk # KRaft 클러스터 고유 ID
+    ports:
+      - "9094:9092" # 호스트 머신에서 접근하기 위한 포트 포워딩
+    healthcheck:
+      test: /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------------------------
+  # PostgreSQL (결과 비교용 Sink DB)
+  # baseline_results, naive_results, flink_results 테이블 자동 생성
+  # -----------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: streamdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432" # 호스트에서 접근 시 5433 포트 사용
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql # 테이블 자동 생성
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # -----------------------------------------------
+  # 데이터 생성기
+  # 기본값: CHAOS OFF (모든 이벤트 즉시 전송)
+  # Phase 2에서 CHAOS_ENABLED=true로 Late Event 주입
+  # -----------------------------------------------
+  generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.python # python:3.12-slim + uv
+    volumes:
+      - ./src:/app/src
+      - ./requirements.txt:/app/requirements.txt
+    command: bash -c "uv pip install --system -q -r requirements.txt && python src/producer.py"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1" # Docker에서 print 즉시 출력
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: payment-log
+      CHAOS_ENABLED: ${CHAOS_ENABLED:-false}
+      CHAOS_LATE_RATE: ${CHAOS_LATE_RATE:-0.2}
+      CHAOS_DELAY_SECONDS: ${CHAOS_DELAY_SECONDS:-5}
+      EVENT_INTERVAL_SECONDS: ${EVENT_INTERVAL_SECONDS:-1}
+
+  # -----------------------------------------------
+  # Python Consumer (기본 실시간 처리 구현)
+  # Processing Time + 메모리 상태 방식으로 집계
+  # Phase 1: baseline_results 저장
+  # Phase 2: RESULT_TABLE=naive_results로 한계 노출
+  # -----------------------------------------------
+  python-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.python # python:3.12-slim + uv
+    volumes:
+      - ./src:/app/src
+      - ./requirements.txt:/app/requirements.txt
+    command: bash -c "uv pip install --system -q -r requirements.txt && python src/naive_consumer.py"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1" # Docker에서 print 즉시 출력
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: payment-log
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-python-consumer-group}
+      CONSUMER_LABEL: ${CONSUMER_LABEL:-python-consumer}
+      RESULT_TABLE: ${RESULT_TABLE:-baseline_results}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: streamdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+  # -----------------------------------------------
+  # Fraud Pattern Generator (사기 패턴 포함 이벤트 생성기)
+  # 기존 generator와 동일한 이미지, 다른 토픽(fraud-payments)
+  # 약 10%의 이벤트에 사기 패턴(소액→고액) 주입
+  # -----------------------------------------------
+  fraud-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    volumes:
+      - ./src:/app/src
+      - ./requirements.txt:/app/requirements.txt
+    command: bash -c "uv pip install --system -q -r requirements.txt && python src/fraud_generator.py"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: fraud-payments
+      FRAUD_RATE: ${FRAUD_RATE:-0.1}
+      EVENT_INTERVAL_SECONDS: ${EVENT_INTERVAL_SECONDS:-1}
+
+  # -----------------------------------------------
+  # Spark Structured Streaming (Bonus: Flink vs Spark 비교)
+  # Micro-batch 모드로 동일한 윈도우 집계 수행
+  # 결과: spark_results 테이블에 저장
+  # -----------------------------------------------
+  spark-submit:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[*]
+      /opt/spark/src/spark_job.py
+    volumes:
+      - ./src:/opt/spark/src
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: payment-log
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: streamdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+  # -----------------------------------------------
+  # Flink JobManager (Web UI: http://localhost:8081)
+  # 잡 제출: docker compose exec jobmanager flink run -py /opt/flink/src/flink_job.py
+  # -----------------------------------------------
+  jobmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile # Multi-stage PyFlink + Connector JARs
+    volumes:
+      - ./src:/opt/flink/src # 소스 코드 마운트
+    ports:
+      - "8081:8081" # Flink Web Dashboard
+    command: jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: payment-log
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: streamdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+
+  # -----------------------------------------------
+  # Flink TaskManager (실제 연산 수행)
+  # taskSlots: 2 → 병렬 처리 가능
+  # -----------------------------------------------
+  taskmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile # JobManager와 동일 이미지
+    depends_on:
+      - jobmanager
+    volumes:
+      - ./src:/opt/flink/src # 소스 코드 마운트
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
