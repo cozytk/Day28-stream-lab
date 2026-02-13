@@ -35,13 +35,9 @@ from pyflink.common import Types, WatermarkStrategy, Row
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
-from pyflink.datastream.connectors.jdbc import (
-    JdbcSink,
-    JdbcConnectionOptions,
-    JdbcExecutionOptions,
-)
 from pyflink.datastream.functions import KeyedProcessFunction, RuntimeContext, MapFunction
 from pyflink.datastream.state import ValueStateDescriptor
+from pyflink.table import StreamTableEnvironment
 
 # ===== 설정 =====
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -158,6 +154,9 @@ class FraudDetector(KeyedProcessFunction):
         """
         self._small_amount_state.clear()
         self._timer_state.clear()
+        # 왜: PyFlink의 on_timer는 process_element과 마찬가지로 generator여야 한다.
+        # yield가 없으면 None을 반환하여 'NoneType' is not iterable 에러 발생.
+        return []
 
     def _clean_up(self, timer_service):
         """상태와 타이머를 모두 정리하는 헬퍼 메서드"""
@@ -237,46 +236,40 @@ def main():
         ),
     )
 
-    # ===== 5. Print Sink (콘솔 출력) =====
-    # 왜: 수업 시연 시 docker compose logs로 실시간 알림을 확인할 수 있다.
-    alerts.print()
-
-    # ===== 6. JDBC Sink (PostgreSQL 저장) =====
-    # 왜: 탐지된 사기 알림을 fraud_alerts 테이블에 저장한다.
-    # Table API에서는 CREATE TABLE sink_ddl WITH ('connector'='jdbc')로 선언했지만,
-    # DataStream API에서는 JdbcSink.sink()로 직접 구성한다.
+    # ===== 5. JDBC Sink (PostgreSQL 저장) — Table API 방식 =====
+    # 왜: DataStream API의 JdbcSink.sink()는 JDBC 커넥터 4.0.0(Flink 2.0)에서
+    # 내부 API가 변경되어 PyFlink 래퍼와 호환되지 않는다.
+    # (NoSuchMethodException: JdbcOutputFormat.createRowJdbcStatementBuilder)
     #
-    # Table API:  INSERT INTO flink_results SELECT ...
-    # DataStream: alerts.add_sink(JdbcSink.sink("INSERT INTO ...", ...))
-    jdbc_sink = JdbcSink.sink(
-        "INSERT INTO fraud_alerts (user_id, small_amount, large_amount) VALUES (?, ?, ?)",
-        type_info=Types.ROW_NAMED(
-            ["user_id", "small_amount", "large_amount"],
-            [Types.STRING(), Types.INT(), Types.INT()],
-        ),
-        jdbc_connection_options=(
-            JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-            .with_url(JDBC_URL)
-            .with_driver_name("org.postgresql.Driver")
-            .with_user_name(POSTGRES_USER)
-            .with_password(POSTGRES_PASSWORD)
-            .build()
-        ),
-        jdbc_execution_options=(
-            JdbcExecutionOptions.builder()
-            .with_batch_interval_ms(1000)
-            .with_batch_size(10)
-            .with_max_retries(3)
-            .build()
-        ),
-    )
-    alerts.add_sink(jdbc_sink)
+    # 해결: DataStream → Table 변환 후, Table API JDBC 커넥터로 저장한다.
+    # flink_job.py에서 'connector'='jdbc'가 정상 동작하는 것과 동일한 방식.
+    # 이렇게 하면 DataStream API(사기 탐지)와 Table API(I/O 커넥터)를 조합할 수 있다.
+    t_env = StreamTableEnvironment.create(env)
 
-    # ===== 7. 실행 =====
-    # 왜: DataStream API에서는 env.execute()로 잡을 제출한다.
-    # Table API에서는 t_env.execute_sql(insert_sql).wait()로 실행했던 것과 대비.
+    alerts_table = t_env.from_data_stream(alerts)
+
+    sink_ddl = f"""
+    CREATE TABLE fraud_alerts_sink (
+        user_id STRING,
+        small_amount INT,
+        large_amount INT
+    ) WITH (
+        'connector' = 'jdbc',
+        'url' = '{JDBC_URL}',
+        'table-name' = 'fraud_alerts',
+        'username' = '{POSTGRES_USER}',
+        'password' = '{POSTGRES_PASSWORD}',
+        'driver' = 'org.postgresql.Driver'
+    )
+    """
+    t_env.execute_sql(sink_ddl)
+
+    # ===== 6. 실행 =====
+    # 왜: Table API의 execute_insert()로 잡을 제출한다.
+    # DataStream API의 env.execute()와 달리, Table 변환 후에는 이 방식을 사용해야 한다.
+    # FraudDetector.process_element() 내부 print()로 콘솔 알림도 함께 출력된다.
     print("[INFO] Fraud Detection Job 제출 중...")
-    env.execute("Fraud Detection Job")
+    alerts_table.execute_insert("fraud_alerts_sink").wait()
 
 
 if __name__ == "__main__":
